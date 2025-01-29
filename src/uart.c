@@ -118,7 +118,7 @@ otError otPlatUartEnable(void)
     params.readCallback   = uartReadCallback;
     params.readReturnMode = UART2_ReadReturnMode_PARTIAL;
     params.eventMask      = UART2_EVENT_TX_FINISHED;
-    params.baudRate       = 115200;
+    params.baudRate       = 460800;
     params.dataLength     = UART2_DataLen_8;
     params.stopBits       = UART2_StopBits_1;
     params.parityType     = UART2_Parity_NONE;

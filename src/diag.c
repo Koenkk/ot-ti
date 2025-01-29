@@ -43,6 +43,8 @@
 
 #include "radio.h"
 
+#if OPENTHREAD_CONFIG_DIAG_ENABLE
+
 /**
  * Window for rx frame to be counted as lost instead of RX nOK.
  *
@@ -544,6 +546,8 @@ void otPlatDiagAlarmCallback(otInstance *aInstance)
         }
     }
 }
+
+#endif // OPENTHREAD_CONFIG_DIAG_ENABLE
 
 #if !OPENTHREAD_CONFIG_DIAG_ENABLE
 /**

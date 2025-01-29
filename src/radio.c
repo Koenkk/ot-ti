@@ -765,8 +765,11 @@ static RF_CmdHandle rfCoreSendTransmitCmd(otInstance *aInstance, RF_Handle aRfHa
         sTransmitCmd.pNextOp        = (RF_Op *)&sRxAckCmd;
         sTransmitCmd.condition.rule = COND_STOP_ON_FALSE;
 
+        uint8_t seqNo;
+        otMacFrameGetSequence(aFrame, &seqNo);
+
         sRxAckCmd.startTrigger.pastTrig     = 1; // XXX: workaround for RF scheduler
-        sRxAckCmd.seqNo                     = otMacFrameGetSequence(aFrame);
+        sRxAckCmd.seqNo                     = seqNo;
         sRxAckCmd.endTrigger.triggerType    = TRIG_REL_PREVEND;
         sRxAckCmd.condition.rule            = COND_NEVER;
 
@@ -2463,8 +2466,13 @@ static void handleRxDataFinish(otInstance *aInstance, unsigned int aEvents, rfc_
     /* Is this an ACK frame? */
     if (otMacFrameIsAck(&receiveFrame))
     {
+        uint8_t rxSeq;
+        uint8_t txSeq;
+
         if (platformRadio_phyState_Transmit == sState && otMacFrameIsAckRequested(&sTransmitFrame) &&
-            otMacFrameGetSequence(&receiveFrame) == otMacFrameGetSequence(&sTransmitFrame))
+            otMacFrameGetSequence(&receiveFrame, &rxSeq) == OT_ERROR_NONE &&
+            otMacFrameGetSequence(&sTransmitFrame, &txSeq) == OT_ERROR_NONE &&
+            rxSeq == txSeq)
         {
             sState = platformRadio_phyState_Receive;
 
