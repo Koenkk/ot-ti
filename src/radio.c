@@ -1795,7 +1795,7 @@ otError otPlatRadioClearSrcMatchExtEntry(otInstance *aInstance, const otExtAddre
     otError  error      = OT_ERROR_NONE;
     uint64_t local_addr = *((uint64_t *)aExtAddress); // ensures alignment
     uint8_t  idx;
-    otEXPECT_ACTION(idx   = rfCoreFindExtSrcMatchIdx(local_addr) != PLATFORM_RADIO_SRC_MATCH_NONE,
+    otEXPECT_ACTION((idx   = rfCoreFindExtSrcMatchIdx(local_addr)) != PLATFORM_RADIO_SRC_MATCH_NONE,
                     error = OT_ERROR_NO_ADDRESS);
 
     /* verify that we have a running or backgrounded rx command */
