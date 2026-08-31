@@ -53,7 +53,7 @@
 #define PLATFORM_UART_EVENT_RX_DONE (1U << 1)
 
 #define PLATFORM_UART_RECV_BUF_LEN 256
-#define PLATFORM_UART_RECV_MQUEUE_LEN 6
+#define PLATFORM_UART_RECV_MQUEUE_LEN 32
 
 static uint8_t PlatformUart_receiveBuffer[PLATFORM_UART_RECV_BUF_LEN];
 
@@ -69,7 +69,7 @@ const  char  UART_procQueueName[] = "/uartrx_process";
 static mqd_t UART_procQueueDesc;
 struct UART_procQueueMsg {
     uint8_t rxBuffer[PLATFORM_UART_RECV_BUF_LEN];
-    uint8_t readLen;
+    size_t  readLen;
 };
 
 static void uartReadCallback(UART2_Handle aHandle, void *aBuf, size_t aLen, void *userArg, int_fast16_t status)
@@ -79,6 +79,11 @@ static void uartReadCallback(UART2_Handle aHandle, void *aBuf, size_t aLen, void
     (void)userArg;
     (void)status;
     struct UART_procQueueMsg rxMsg;
+
+    if (aLen > PLATFORM_UART_RECV_BUF_LEN)
+    {
+        aLen = PLATFORM_UART_RECV_BUF_LEN;
+    }
 
     memcpy(rxMsg.rxBuffer, PlatformUart_receiveBuffer, aLen);
     rxMsg.readLen = aLen;
@@ -97,6 +102,7 @@ static void uartWriteCallback(UART2_Handle aHandle, void *aBuf, size_t aLen, voi
     (void)aBuf;
     (void)aLen;
     (void)userArg;
+    (void)status;
 
     SemaphoreP_post(PlatformUart_writeSemHandle);
     platformUartSignal(PLATFORM_UART_EVENT_TX_DONE);
@@ -162,6 +168,15 @@ otError otPlatUartSend(const uint8_t *aBuf, uint16_t aBufLength)
 #endif
     ret = UART2_write(PlatformUart_uartHandle, aBuf, aBufLength, NULL);
 
+    if (ret != UART2_STATUS_SUCCESS)
+    {
+#if !TI_PLAT_UART_BLOCKING
+        SemaphoreP_post(PlatformUart_writeSemHandle);
+#endif
+        platformUartSignal(PLATFORM_UART_EVENT_TX_DONE);
+        return OT_ERROR_FAILED;
+    }
+
 #if TI_PLAT_UART_BLOCKING
     platformUartSignal(PLATFORM_UART_EVENT_TX_DONE);
 #endif
@@ -180,8 +195,10 @@ void platformUartProcess(uintptr_t arg)
     {
         struct UART_procQueueMsg rxMsg;
 
-        mq_receive(UART_procQueueDesc, (char *)&rxMsg, sizeof(struct UART_procQueueMsg), NULL);
-        otPlatUartReceived(rxMsg.rxBuffer, rxMsg.readLen);
+        while (mq_receive(UART_procQueueDesc, (char *)&rxMsg, sizeof(struct UART_procQueueMsg), NULL) > 0)
+        {
+            otPlatUartReceived(rxMsg.rxBuffer, rxMsg.readLen);
+        }
     }
 }
 
