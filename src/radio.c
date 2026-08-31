@@ -178,7 +178,7 @@ static RF_CmdHandle sTxTestCmdHandle;
  * Value requested in dBm from the upper layers on the last call to
  * @ref otPlatRadioSetTransmitPower.
  */
-static int8_t sReqTxPower = 0U;
+static int8_t sReqTxPower = 20;
 static uint16_t sCurrentRegionCode = 0;
 
 /**
@@ -489,37 +489,20 @@ static RF_Stat rfCoreModifyRxAutoPend(RF_Handle aRfHandle, bool aEnable)
  * @return the value from the command status register
  * @retval RF_StatCmdDoneSuccess the command completed correctly
  */
-static RF_Stat rfCoreModifySourceMatchEntry(RF_Handle             aRfHandle,
-                                            uint8_t               aEntryNo,
-                                            platformRadio_address aType,
-                                            bool                  aEnable)
+static RF_Stat rfCoreModifySourceMatchEntry(RF_Handle aRfHandle, uint8_t aEntryNo, platformRadio_address aType,
+                                            bool aEnable)
 {
-    /* memset kept to save 60 bytes of text space, gcc can't optimize the
-     * following bitfield operation if it doesn't know the fields are zero
-     * already.
+    (void)aRfHandle;
+    (void)aEntryNo;
+    (void)aType;
+    (void)aEnable;
+
+    /*
+     * The CC2652 RF core reads the source match tables directly from RAM
+     * (sSrcMatchShortData and sSrcMatchExtData). Direct memory updates are
+     * instantaneous and avoid any doorbell lock or interrupt race conditions.
      */
-    memset((void *)&sModifyReceiveSrcMatchCmd, 0, sizeof(sModifyReceiveSrcMatchCmd));
-
-    sModifyReceiveSrcMatchCmd.commandNo = CMD_IEEE_MOD_SRC_MATCH;
-
-    /* we only use source matching for pending data bit, so enabling and
-     * pending are the same to us.
-     */
-    if (aEnable)
-    {
-        sModifyReceiveSrcMatchCmd.options.bEnable = 1;
-        sModifyReceiveSrcMatchCmd.options.srcPend = 1;
-    }
-    else
-    {
-        sModifyReceiveSrcMatchCmd.options.bEnable = 0;
-        sModifyReceiveSrcMatchCmd.options.srcPend = 0;
-    }
-
-    sModifyReceiveSrcMatchCmd.options.entryType = aType;
-    sModifyReceiveSrcMatchCmd.entryNo           = aEntryNo;
-
-    return RF_runImmediateCmd(aRfHandle, (uint32_t *)&sModifyReceiveSrcMatchCmd);
+    return RF_StatCmdDoneSuccess;
 }
 
 /**
@@ -536,7 +519,8 @@ static uint8_t rfCoreFindShortSrcMatchIdx(const uint16_t aAddress)
 
     for (i = 0; i < PLATFORM_RADIO_SHORTADD_SRC_MATCH_NUM; i++)
     {
-        if (sSrcMatchShortData.shortAddrEnt[i].shortAddr == aAddress)
+        if ((sSrcMatchShortData.srcMatchEn[i / 32] & (1 << (i % 32))) &&
+            sSrcMatchShortData.shortAddrEnt[i].shortAddr == aAddress)
         {
             return i;
         }
@@ -580,7 +564,8 @@ static uint8_t rfCoreFindExtSrcMatchIdx(const uint64_t aAddress)
 
     for (i = 0; i < PLATFORM_RADIO_EXTADD_SRC_MATCH_NUM; i++)
     {
-        if (sSrcMatchExtData.extAddrEnt[i] == aAddress)
+        if ((sSrcMatchExtData.srcMatchEn[i / 32] & (1 << (i % 32))) &&
+            sSrcMatchExtData.extAddrEnt[i] == aAddress)
         {
             return i;
         }
@@ -1728,13 +1713,11 @@ otError otPlatRadioAddSrcMatchShortEntry(otInstance *aInstance, const uint16_t a
         sSrcMatchShortData.shortAddrEnt[idx].panId     = sReceiveCmd.localPanID;
     }
 
+    sSrcMatchShortData.srcPendEn[idx / 32] |= (1 << (idx % 32));
+    sSrcMatchShortData.srcMatchEn[idx / 32] |= (1 << (idx % 32));
+
     /* attempt to modify running or backgrounded rx command */
-    if (rfCoreModifySourceMatchEntry(sRfHandle, idx, platformRadio_address_short, true) != RF_StatCmdDoneSuccess)
-    {
-        /* we are not running, so we must update the values ourselves */
-        sSrcMatchShortData.srcPendEn[idx / 32] |= (1 << (idx % 32));
-        sSrcMatchShortData.srcMatchEn[idx / 32] |= (1 << (idx % 32));
-    }
+    rfCoreModifySourceMatchEntry(sRfHandle, idx, platformRadio_address_short, true);
 
 exit:
     return error;
@@ -1742,22 +1725,20 @@ exit:
 
 otError otPlatRadioClearSrcMatchShortEntry(otInstance *aInstance, const uint16_t aShortAddress)
 {
-    otError error = OT_ERROR_NONE;
     (void)aInstance;
-    uint8_t idx;
-    otEXPECT_ACTION((idx = rfCoreFindShortSrcMatchIdx(aShortAddress)) != PLATFORM_RADIO_SRC_MATCH_NONE,
-                    error = OT_ERROR_NO_ADDRESS);
+    uint8_t idx = rfCoreFindShortSrcMatchIdx(aShortAddress);
 
-    /* verify that we have a running or backgrounded rx command */
-    if (rfCoreModifySourceMatchEntry(sRfHandle, idx, platformRadio_address_short, false) != RF_StatCmdDoneSuccess)
+    if (idx != PLATFORM_RADIO_SRC_MATCH_NONE)
     {
-        /* we are not running, so we must update the values ourselves */
         sSrcMatchShortData.srcPendEn[idx / 32] &= ~(1 << (idx % 32));
         sSrcMatchShortData.srcMatchEn[idx / 32] &= ~(1 << (idx % 32));
+        sSrcMatchShortData.shortAddrEnt[idx].shortAddr = 0xFFFF;
+
+        /* verify that we have a running or backgrounded rx command */
+        rfCoreModifySourceMatchEntry(sRfHandle, idx, platformRadio_address_short, false);
     }
 
-exit:
-    return error;
+    return OT_ERROR_NONE;
 }
 
 otError otPlatRadioAddSrcMatchExtEntry(otInstance *aInstance, const otExtAddress *aExtAddress)
@@ -1765,7 +1746,8 @@ otError otPlatRadioAddSrcMatchExtEntry(otInstance *aInstance, const otExtAddress
     (void)aInstance;
 
     otError  error      = OT_ERROR_NONE;
-    uint64_t local_addr = *((uint64_t *)aExtAddress); // ensures alignment
+    uint64_t local_addr = 0;
+    memcpy(&local_addr, aExtAddress, sizeof(local_addr));
     uint8_t  idx        = rfCoreFindExtSrcMatchIdx(local_addr);
 
     if (idx == PLATFORM_RADIO_SRC_MATCH_NONE)
@@ -1773,16 +1755,14 @@ otError otPlatRadioAddSrcMatchExtEntry(otInstance *aInstance, const otExtAddress
         /* the entry does not exist already, add it */
         otEXPECT_ACTION((idx = rfCoreFindEmptyExtSrcMatchIdx()) != PLATFORM_RADIO_SRC_MATCH_NONE,
                         error = OT_ERROR_NO_BUFS);
-        sSrcMatchExtData.extAddrEnt[idx] = *((uint64_t *)aExtAddress);
+        memcpy((void *)&sSrcMatchExtData.extAddrEnt[idx], aExtAddress, sizeof(uint64_t));
     }
 
+    sSrcMatchExtData.srcPendEn[idx / 32] |= (1 << (idx % 32));
+    sSrcMatchExtData.srcMatchEn[idx / 32] |= (1 << (idx % 32));
+
     /* verify that we have a running or backgrounded rx command */
-    if (rfCoreModifySourceMatchEntry(sRfHandle, idx, platformRadio_address_ext, true) != RF_StatCmdDoneSuccess)
-    {
-        /* we are not running, so we must update the values ourselves */
-        sSrcMatchExtData.srcPendEn[idx / 32] |= (1 << (idx % 32));
-        sSrcMatchExtData.srcMatchEn[idx / 32] |= (1 << (idx % 32));
-    }
+    rfCoreModifySourceMatchEntry(sRfHandle, idx, platformRadio_address_ext, true);
 
 exit:
     return error;
@@ -1792,66 +1772,53 @@ otError otPlatRadioClearSrcMatchExtEntry(otInstance *aInstance, const otExtAddre
 {
     (void)aInstance;
 
-    otError  error      = OT_ERROR_NONE;
-    uint64_t local_addr = *((uint64_t *)aExtAddress); // ensures alignment
-    uint8_t  idx;
-    otEXPECT_ACTION(idx   = rfCoreFindExtSrcMatchIdx(local_addr) != PLATFORM_RADIO_SRC_MATCH_NONE,
-                    error = OT_ERROR_NO_ADDRESS);
+    uint64_t local_addr = 0;
+    memcpy(&local_addr, aExtAddress, sizeof(local_addr));
+    uint8_t  idx        = rfCoreFindExtSrcMatchIdx(local_addr);
 
-    /* verify that we have a running or backgrounded rx command */
-    if (rfCoreModifySourceMatchEntry(sRfHandle, idx, platformRadio_address_ext, false) != RF_StatCmdDoneSuccess)
+    if (idx != PLATFORM_RADIO_SRC_MATCH_NONE)
     {
-        /* we are not running, so we must update the values ourselves */
         sSrcMatchExtData.srcPendEn[idx / 32] &= ~(1 << (idx % 32));
         sSrcMatchExtData.srcMatchEn[idx / 32] &= ~(1 << (idx % 32));
+        sSrcMatchExtData.extAddrEnt[idx] = 0;
+
+        /* verify that we have a running or backgrounded rx command */
+        rfCoreModifySourceMatchEntry(sRfHandle, idx, platformRadio_address_ext, false);
     }
 
-exit:
-    return error;
+    return OT_ERROR_NONE;
 }
 
 void otPlatRadioClearSrcMatchShortEntries(otInstance *aInstance)
 {
     (void)aInstance;
 
+    memset((void *)&sSrcMatchShortData, 0, sizeof(sSrcMatchShortData));
+
     if (sState == platformRadio_phyState_Receive || sState == platformRadio_phyState_Transmit)
     {
         unsigned int i;
         for (i = 0; i < PLATFORM_RADIO_SHORTADD_SRC_MATCH_NUM; i++)
         {
-            /* we have a running or backgrounded rx command */
-            otEXPECT(rfCoreModifySourceMatchEntry(sRfHandle, i, platformRadio_address_short, false) == CMDSTA_Done);
+            rfCoreModifySourceMatchEntry(sRfHandle, i, platformRadio_address_short, false);
         }
     }
-    else
-    {
-        /* we are not running, so we can erase them ourselves */
-        memset((void *)&sSrcMatchShortData, 0, sizeof(sSrcMatchShortData));
-    }
-exit:
-    return;
 }
 
 void otPlatRadioClearSrcMatchExtEntries(otInstance *aInstance)
 {
     (void)aInstance;
 
+    memset((void *)&sSrcMatchExtData, 0, sizeof(sSrcMatchExtData));
+
     if (sState == platformRadio_phyState_Receive || sState == platformRadio_phyState_Transmit)
     {
         unsigned int i;
         for (i = 0; i < PLATFORM_RADIO_EXTADD_SRC_MATCH_NUM; i++)
         {
-            /* we have a running or backgrounded rx command */
-            otEXPECT(rfCoreModifySourceMatchEntry(sRfHandle, i, platformRadio_address_ext, false) == CMDSTA_Done);
+            rfCoreModifySourceMatchEntry(sRfHandle, i, platformRadio_address_ext, false);
         }
     }
-    else
-    {
-        /* we are not running, so we can erase them ourselves */
-        memset((void *)&sSrcMatchExtData, 0, sizeof(sSrcMatchExtData));
-    }
-exit:
-    return;
 }
 
 bool otPlatRadioGetPromiscuous(otInstance *aInstance)
@@ -2012,13 +1979,13 @@ void otPlatRadioSetExtendedAddress(otInstance *aInstance, const otExtAddress *aA
 
     if (platformRadio_phyState_Sleep == sState || platformRadio_phyState_Disabled == sState)
     {
-        sReceiveCmd.localExtAddr = *((uint64_t *)(aAddress));
+        memcpy((void *)&sReceiveCmd.localExtAddr, aAddress, sizeof(uint64_t));
     }
     else
     {
         rfCoreExecuteAbortCmd(sRfHandle, sReceiveCmdHandle);
 
-        sReceiveCmd.localExtAddr = *((uint64_t *)(aAddress));
+        memcpy((void *)&sReceiveCmd.localExtAddr, aAddress, sizeof(uint64_t));
 
         rfCoreSendReceiveCmd(sRfHandle);
     }
@@ -2594,7 +2561,7 @@ void processAckCreation(otInstance *aInstance)
              * length in octets * 32uS per octet + 192uS of turnaround = tx delay
              */
             sTransmitAckCmdHandle = rfCoreSendTransmitCmd(aInstance, sRfHandle, &sAckFrame, true);
-            if (sTransmitCmdHandle > 0)
+            if (sTransmitAckCmdHandle > 0)
             {
                 sState = platformRadio_phyState_RxTxAck;
             }
