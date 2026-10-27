@@ -175,10 +175,22 @@ static RF_CmdHandle sTransmitAckCmdHandle;
 static RF_CmdHandle sTxTestCmdHandle;
 
 /**
+ * The power before the host sets one: OpenThread's
+ * OPENTHREAD_CONFIG_DEFAULT_TRANSMIT_POWER, except on the CC1352P-2 design,
+ * whose 20 dBm PA its 0 dBm leaves unused. 6 dBm is the default of the
+ * OpenThread RCPs Home Assistant ships.
+ */
+#if defined(LAUNCHXL_CC1352P_2)
+#define PLATFORM_RADIO_DEFAULT_TX_POWER 6
+#else
+#define PLATFORM_RADIO_DEFAULT_TX_POWER OPENTHREAD_CONFIG_DEFAULT_TRANSMIT_POWER
+#endif
+
+/**
  * Value requested in dBm from the upper layers on the last call to
  * @ref otPlatRadioSetTransmitPower.
  */
-static int8_t sReqTxPower = 0U;
+static int8_t sReqTxPower = PLATFORM_RADIO_DEFAULT_TX_POWER;
 static uint16_t sCurrentRegionCode = 0;
 
 /**
@@ -205,6 +217,37 @@ static const struct tx_power_max cTxMaxPower[] = {
 
 #endif
 };
+
+#if defined(LAUNCHXL_CC1352P_2)
+/**
+ * High PA settings for 6 to 13 dBm, which TI's PA data leaves out between the
+ * default PA's 5 dBm and the high PA's 14 dBm. TI has not characterised them;
+ * they are the ones Koenkk's Z-Stack firmware has shipped for this design
+ * (Koenkk/Z-Stack-firmware, coordinator/Z-Stack_3.x.0/firmware.patch, the
+ * CC1352P_2_LAUNCHXL ti_radio_config.c). On a Sonoff ZBDongle-P, by the
+ * RSSI a Matter device reported for its frames, they radiate about 2 to 3 dB
+ * above their labels relative to TI's 14 dBm entry.
+ */
+static const RF_TxPowerTable_Entry cTxPowerTableExtra[] = {
+    {6, .value.rawValue = 0x144f2a, .value.paType = RF_TxPowerTable_HighPA},
+    {7, .value.rawValue = 0x14285f, .value.paType = RF_TxPowerTable_HighPA},
+    {8, .value.rawValue = 0x10335a, .value.paType = RF_TxPowerTable_HighPA},
+    {9, .value.rawValue = 0x103f5f, .value.paType = RF_TxPowerTable_HighPA},
+    {10, .value.rawValue = 0x104f66, .value.paType = RF_TxPowerTable_HighPA},
+    {11, .value.rawValue = 0x3021cb, .value.paType = RF_TxPowerTable_HighPA},
+    {12, .value.rawValue = 0x3f27cc, .value.paType = RF_TxPowerTable_HighPA},
+    {13, .value.rawValue = 0x3fc3cd, .value.paType = RF_TxPowerTable_HighPA},
+};
+
+/**
+ * The generated txPowerTable with cTxPowerTableExtra merged in, built by
+ * rfCoreInitTxPowerTable. TX_POWER_TABLE_SIZE counts the termination entry.
+ */
+static RF_TxPowerTable_Entry sTxPowerTable[TX_POWER_TABLE_SIZE + otARRAY_LENGTH(cTxPowerTableExtra)];
+#define TX_POWER_TABLE sTxPowerTable
+#else
+#define TX_POWER_TABLE txPowerTable
+#endif
 
 /* Status of the coex priority signal line. This is passed to the RF Driver
  * with the scheduling parameters for each command. The value of this will only
@@ -918,15 +961,14 @@ static void rfCoreSendReceiveCmd(RF_Handle aRfHandle)
 }
 
 /**
- * @brief Sets the transmit.
+ * @brief Finds the power table value for a requested power.
  *
- * Sets the transmit power within the radio setup command or the override list.
+ * Caps the request at the current channel's back-off, then takes the table
+ * step at or below it.
  */
-static otError rfCoreSetTransmitPower(int8_t aPower)
+static RF_TxPowerTable_Value rfCoreTxPowerValue(int8_t aPower)
 {
-    otError               retval = OT_ERROR_NONE;
-    RF_TxPowerTable_Value newValue;
-    unsigned int          i;
+    unsigned int i;
 
     /* search for a matching backoff if there is one */
     for (i = 0; i < (sizeof(cTxMaxPower) / sizeof(cTxMaxPower[0])); i++)
@@ -938,8 +980,18 @@ static otError rfCoreSetTransmitPower(int8_t aPower)
         }
     }
 
-    /* find the tx power configuration */
-    newValue = RF_TxPowerTable_findValue(txPowerTable, aPower);
+    return RF_TxPowerTable_findValue(TX_POWER_TABLE, aPower);
+}
+
+/**
+ * @brief Sets the transmit.
+ *
+ * Sets the transmit power within the radio setup command or the override list.
+ */
+static otError rfCoreSetTransmitPower(int8_t aPower)
+{
+    otError               retval   = OT_ERROR_NONE;
+    RF_TxPowerTable_Value newValue = rfCoreTxPowerValue(aPower);
 
     otEXPECT_ACTION(RF_TxPowerTable_INVALID_VALUE != newValue.rawValue, retval = OT_ERROR_INVALID_ARGS);
     otEXPECT_ACTION(RF_StatSuccess == RF_setTxPower(sRfHandle, newValue), retval = OT_ERROR_FAILED);
@@ -1105,8 +1157,43 @@ void rfCoreRequestCoex(bool aEnable)
     }
 }
 
+/**
+ * Merges cTxPowerTableExtra into the generated txPowerTable. Both ascend in
+ * power, as RF_TxPowerTable_findValue requires; where both hold a power,
+ * TI's characterised entry wins.
+ */
+static void rfCoreInitTxPowerTable(void)
+{
+#if defined(LAUNCHXL_CC1352P_2)
+    const RF_TxPowerTable_Entry *ti       = txPowerTable;
+    const RF_TxPowerTable_Entry *extra    = cTxPowerTableExtra;
+    const RF_TxPowerTable_Entry *extraEnd = extra + otARRAY_LENGTH(cTxPowerTableExtra);
+    RF_TxPowerTable_Entry       *out      = sTxPowerTable;
+
+    while (ti->power != RF_TxPowerTable_INVALID_DBM || extra < extraEnd)
+    {
+        if (extra < extraEnd && (ti->power == RF_TxPowerTable_INVALID_DBM || extra->power < ti->power))
+        {
+            *out++ = *extra++;
+        }
+        else
+        {
+            if (extra < extraEnd && extra->power == ti->power)
+            {
+                extra++;
+            }
+            *out++ = *ti++;
+        }
+    }
+
+    /* the termination entry */
+    *out = *ti;
+#endif
+}
+
 void platformRadioInit(void)
 {
+    rfCoreInitTxPowerTable();
     rfCoreInitBufs();
     rfCoreInitSetupCmd();
     /* Populate the RX parameters data structure with default values */
@@ -1136,6 +1223,9 @@ otError otPlatRadioEnable(otInstance *aInstance)
 
         otEXPECT_ACTION(sRfHandle != NULL, error = OT_ERROR_FAILED);
         sState = platformRadio_phyState_Sleep;
+
+        /* the power the host set while the radio was disabled */
+        rfCoreSetTransmitPower(sReqTxPower);
 
         error = OT_ERROR_NONE;
     }
@@ -1229,20 +1319,45 @@ exit:
 
 otError otPlatRadioSetTransmitPower(otInstance *aInstance, int8_t aPower)
 {
+    otError error = OT_ERROR_NONE;
     (void)aInstance;
-    /* update the tracking variable */
+
+    otEXPECT_ACTION(RF_TxPowerTable_findValue(TX_POWER_TABLE, aPower).rawValue != RF_TxPowerTable_INVALID_VALUE,
+                    error = OT_ERROR_INVALID_ARGS);
     sReqTxPower = aPower;
-    /* set the power */
-    return rfCoreSetTransmitPower(aPower);
+
+    /* A disabled radio has no RF driver client (otbr-agent sets a power
+     * before it enables the radio); otPlatRadioEnable applies sReqTxPower
+     * when it opens one.
+     */
+    if (sState != platformRadio_phyState_Disabled)
+    {
+        error = rfCoreSetTransmitPower(aPower);
+    }
+
+exit:
+    return error;
 }
 
 otError otPlatRadioGetTransmitPower(otInstance *aInstance, int8_t *aPower)
 {
-    otError error = OT_ERROR_NONE;
+    otError               error = OT_ERROR_NONE;
+    RF_TxPowerTable_Value value;
     (void)aInstance;
 
     otEXPECT_ACTION(aPower != NULL, error = OT_ERROR_INVALID_ARGS);
-    *aPower = RF_TxPowerTable_findPowerLevel(txPowerTable, RF_getTxPower(sRfHandle));
+
+    /* see otPlatRadioSetTransmitPower */
+    if (sState == platformRadio_phyState_Disabled)
+    {
+        value = rfCoreTxPowerValue(sReqTxPower);
+    }
+    else
+    {
+        value = RF_getTxPower(sRfHandle);
+    }
+
+    *aPower = RF_TxPowerTable_findPowerLevel(TX_POWER_TABLE, value);
 
 exit:
     return error;
@@ -1764,16 +1879,23 @@ otError otPlatRadioAddSrcMatchExtEntry(otInstance *aInstance, const otExtAddress
 {
     (void)aInstance;
 
-    otError  error      = OT_ERROR_NONE;
-    uint64_t local_addr = *((uint64_t *)aExtAddress); // ensures alignment
-    uint8_t  idx        = rfCoreFindExtSrcMatchIdx(local_addr);
+    otError  error = OT_ERROR_NONE;
+    uint64_t local_addr;
+    uint8_t  idx;
+
+    /* otExtAddress is a byte array, so the platform may assume no more than
+     * byte alignment: a uint64_t load through it compiles to LDRD, which
+     * faults on an address that is not word aligned.
+     */
+    memcpy(&local_addr, aExtAddress, sizeof(local_addr));
+    idx = rfCoreFindExtSrcMatchIdx(local_addr);
 
     if (idx == PLATFORM_RADIO_SRC_MATCH_NONE)
     {
         /* the entry does not exist already, add it */
         otEXPECT_ACTION((idx = rfCoreFindEmptyExtSrcMatchIdx()) != PLATFORM_RADIO_SRC_MATCH_NONE,
                         error = OT_ERROR_NO_BUFS);
-        sSrcMatchExtData.extAddrEnt[idx] = *((uint64_t *)aExtAddress);
+        sSrcMatchExtData.extAddrEnt[idx] = local_addr;
     }
 
     /* verify that we have a running or backgrounded rx command */
@@ -1792,10 +1914,13 @@ otError otPlatRadioClearSrcMatchExtEntry(otInstance *aInstance, const otExtAddre
 {
     (void)aInstance;
 
-    otError  error      = OT_ERROR_NONE;
-    uint64_t local_addr = *((uint64_t *)aExtAddress); // ensures alignment
+    otError  error = OT_ERROR_NONE;
+    uint64_t local_addr;
     uint8_t  idx;
-    otEXPECT_ACTION(idx   = rfCoreFindExtSrcMatchIdx(local_addr) != PLATFORM_RADIO_SRC_MATCH_NONE,
+
+    /* see otPlatRadioAddSrcMatchExtEntry */
+    memcpy(&local_addr, aExtAddress, sizeof(local_addr));
+    otEXPECT_ACTION((idx = rfCoreFindExtSrcMatchIdx(local_addr)) != PLATFORM_RADIO_SRC_MATCH_NONE,
                     error = OT_ERROR_NO_ADDRESS);
 
     /* verify that we have a running or backgrounded rx command */
@@ -1819,8 +1944,13 @@ void otPlatRadioClearSrcMatchShortEntries(otInstance *aInstance)
         unsigned int i;
         for (i = 0; i < PLATFORM_RADIO_SHORTADD_SRC_MATCH_NUM; i++)
         {
-            /* we have a running or backgrounded rx command */
-            otEXPECT(rfCoreModifySourceMatchEntry(sRfHandle, i, platformRadio_address_short, false) == CMDSTA_Done);
+            /* attempt to modify running or backgrounded rx command */
+            if (rfCoreModifySourceMatchEntry(sRfHandle, i, platformRadio_address_short, false) != RF_StatCmdDoneSuccess)
+            {
+                /* we are not running, so we must update the values ourselves */
+                sSrcMatchShortData.srcPendEn[i / 32] &= ~(1 << (i % 32));
+                sSrcMatchShortData.srcMatchEn[i / 32] &= ~(1 << (i % 32));
+            }
         }
     }
     else
@@ -1828,8 +1958,6 @@ void otPlatRadioClearSrcMatchShortEntries(otInstance *aInstance)
         /* we are not running, so we can erase them ourselves */
         memset((void *)&sSrcMatchShortData, 0, sizeof(sSrcMatchShortData));
     }
-exit:
-    return;
 }
 
 void otPlatRadioClearSrcMatchExtEntries(otInstance *aInstance)
@@ -1841,8 +1969,13 @@ void otPlatRadioClearSrcMatchExtEntries(otInstance *aInstance)
         unsigned int i;
         for (i = 0; i < PLATFORM_RADIO_EXTADD_SRC_MATCH_NUM; i++)
         {
-            /* we have a running or backgrounded rx command */
-            otEXPECT(rfCoreModifySourceMatchEntry(sRfHandle, i, platformRadio_address_ext, false) == CMDSTA_Done);
+            /* attempt to modify running or backgrounded rx command */
+            if (rfCoreModifySourceMatchEntry(sRfHandle, i, platformRadio_address_ext, false) != RF_StatCmdDoneSuccess)
+            {
+                /* we are not running, so we must update the values ourselves */
+                sSrcMatchExtData.srcPendEn[i / 32] &= ~(1 << (i % 32));
+                sSrcMatchExtData.srcMatchEn[i / 32] &= ~(1 << (i % 32));
+            }
         }
     }
     else
@@ -1850,8 +1983,6 @@ void otPlatRadioClearSrcMatchExtEntries(otInstance *aInstance)
         /* we are not running, so we can erase them ourselves */
         memset((void *)&sSrcMatchExtData, 0, sizeof(sSrcMatchExtData));
     }
-exit:
-    return;
 }
 
 bool otPlatRadioGetPromiscuous(otInstance *aInstance)
@@ -2009,16 +2140,20 @@ void otPlatRadioSetPanId(otInstance *aInstance, uint16_t aPanid)
 void otPlatRadioSetExtendedAddress(otInstance *aInstance, const otExtAddress *aAddress)
 {
     (void)aInstance;
+    uint64_t address;
+
+    /* see otPlatRadioAddSrcMatchExtEntry */
+    memcpy(&address, aAddress, sizeof(address));
 
     if (platformRadio_phyState_Sleep == sState || platformRadio_phyState_Disabled == sState)
     {
-        sReceiveCmd.localExtAddr = *((uint64_t *)(aAddress));
+        sReceiveCmd.localExtAddr = address;
     }
     else
     {
         rfCoreExecuteAbortCmd(sRfHandle, sReceiveCmdHandle);
 
-        sReceiveCmd.localExtAddr = *((uint64_t *)(aAddress));
+        sReceiveCmd.localExtAddr = address;
 
         rfCoreSendReceiveCmd(sRfHandle);
     }

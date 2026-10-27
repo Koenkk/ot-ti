@@ -32,6 +32,12 @@ project(ot-cc13x2-cc26x2 VERSION 1.4.0.0)
 set(FW_VERSION_ENV $ENV{FW_VERSION})
 set(OT_PACKAGE_VERSION "1.4.0-Koenkk-${FW_VERSION_ENV}" CACHE STRING "ot-ti version" FORCE)
 
+# Assert messages carry __FILE__: keep the checkout's path out of the image.
+# GCC has the option from 8 on.
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU" AND CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL 8)
+    add_compile_options(-fmacro-prefix-map=${PROJECT_SOURCE_DIR}/=)
+endif()
+
 if(NOT DEFINED TI_SIMPLELINK_KERNEL)
     set(TI_SIMPLELINK_KERNEL "freertos" CACHE STRING "")
 endif()

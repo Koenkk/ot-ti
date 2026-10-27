@@ -50,6 +50,8 @@
 
 /* Example/Board Header files */
 #include "ti_drivers_config.h"
+#include <ti/drivers/Watchdog.h>
+#include <ti/drivers/dpl/ClockP.h>
 #include "utils/code_utils.h"
 
 #include "system.h"
@@ -65,11 +67,22 @@
  *  7   main processing loop commands
  *  6   radio process requests
  *  2   UART process requests
+ *  1   watchdog heartbeat
  * +1   buffer
  * -----------------------------------
- *  16  queue slots
+ *  17  queue slots
  */
-#define OTSTACK_PROC_QUEUE_MAX_MSG      (16)
+#define OTSTACK_PROC_QUEUE_MAX_MSG      (17)
+
+/* How often the heartbeat asks the processing loop whether it still runs.
+ * Keep it well under the watchdog's period (CONFIG_WATCHDOG0 in
+ * openthread.syscfg, 2000 ms). Without a clear, the CC26x2 watchdog raises
+ * an NMI at its first expiry and resets at the second; the CC26x4 one
+ * resets at the first. A loop that stops answering is cleared for at most
+ * one more heartbeat, so the device resets within about 4.5 s (CC26x2) or
+ * 2.5 s (CC26x4); with interrupts left disabled, within two periods.
+ */
+#define OTSTACK_HEARTBEAT_PERIOD_MS     (500)
 
 enum OtStack_procQueueCmd
 {
@@ -79,6 +92,7 @@ enum OtStack_procQueueCmd
     OtStack_procQueueCmd_uart,
     OtStack_procQueueCmd_alarmu,
     OtStack_procQueueCmd_spi,
+    OtStack_procQueueCmd_heartbeat,
 };
 
 struct OtStack_procQueueMsg {
@@ -90,6 +104,62 @@ struct OtStack_procQueueMsg {
 const  char  OtStack_procQueueName[] = "/tiop_process";
 static mqd_t OtStack_procQueueDesc;
 static mqd_t OtStack_procQueueLoopDesc;
+
+/* The watchdog is cleared only while the processing loop answers the
+ * heartbeat: a hung RCP otherwise needs a power cycle, which the host can
+ * not give it, while one that resets is brought up again by the host.
+ */
+static Watchdog_Handle    OtStack_watchdog;
+static ClockP_Struct      OtStack_heartbeatClock;
+static volatile bool      OtStack_heartbeatAnswered = true;
+static bool               OtStack_heartbeatPosted;
+
+static void heartbeatFxn(uintptr_t arg)
+{
+    struct OtStack_procQueueMsg msg;
+    (void)arg;
+
+    if (OtStack_heartbeatAnswered)
+    {
+        Watchdog_clear(OtStack_watchdog);
+
+        OtStack_heartbeatAnswered = false;
+        OtStack_heartbeatPosted   = false;
+    }
+
+    /* A full queue delays the heartbeat to the next tick; a loop that never
+     * drains it never answers, and the watchdog resets the device.
+     */
+    if (!OtStack_heartbeatPosted)
+    {
+        msg.cmd                 = OtStack_procQueueCmd_heartbeat;
+        OtStack_heartbeatPosted = (0 == mq_send(OtStack_procQueueDesc, (const char *)&msg, sizeof(msg), 0));
+    }
+}
+
+static void watchdogInit(void)
+{
+    Watchdog_Params watchdogParams;
+    ClockP_Params   clockParams;
+    uint32_t        ticks = (OTSTACK_HEARTBEAT_PERIOD_MS * 1000) / ClockP_getSystemTickPeriod();
+
+    if (OtStack_watchdog != NULL)
+    {
+        /* otSysInit runs again after a pseudo reset */
+        return;
+    }
+
+    Watchdog_init();
+    Watchdog_Params_init(&watchdogParams);
+    watchdogParams.resetMode = Watchdog_RESET_ON;
+    OtStack_watchdog         = Watchdog_open(CONFIG_WATCHDOG0, &watchdogParams);
+    assert(OtStack_watchdog != NULL);
+
+    ClockP_Params_init(&clockParams);
+    clockParams.period    = ticks;
+    clockParams.startFlag = true;
+    ClockP_construct(&OtStack_heartbeatClock, heartbeatFxn, ticks, &clockParams);
+}
 
 void otSysInit(int argc, char *argv[])
 {
@@ -117,6 +187,8 @@ void otSysInit(int argc, char *argv[])
     platformAlarmMicroInit();
     platformRandomInit();
     platformRadioInit();
+
+    watchdogInit();
 }
 
 bool otSysPseudoResetWasRequested(void)
@@ -170,7 +242,7 @@ void platformAlarmMicroSignal()
     (void) ret;
 }
 
-void platformUartSignal(uintptr_t arg)
+bool platformUartSignal(uintptr_t arg)
 {
     struct OtStack_procQueueMsg msg;
     int                         ret;
@@ -179,7 +251,7 @@ void platformUartSignal(uintptr_t arg)
     ret = mq_send(OtStack_procQueueDesc, (const char *)&msg, sizeof(msg), 0);
     assert(0 == ret);
 
-    (void) ret;
+    return (0 == ret);
 }
 
 void platformSpiSignal()
@@ -265,6 +337,16 @@ void otSysProcessDrivers(otInstance *aInstance)
             case OtStack_procQueueCmd_spi:
             {
                 platformSpiProcess();
+                break;
+            }
+
+            case OtStack_procQueueCmd_heartbeat:
+            {
+                OtStack_heartbeatAnswered = true;
+#if OPENTHREAD_CONFIG_NCP_HDLC_ENABLE || TIOP_ENABLE_UART
+                /* catch up on uart work whose signal was lost */
+                platformUartPoll();
+#endif
                 break;
             }
 

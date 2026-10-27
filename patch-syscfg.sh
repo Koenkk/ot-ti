@@ -1,4 +1,5 @@
-#/bin/bash -e
+#!/usr/bin/env bash
+set -e
 echo "Patching generated syscfg files:"
 
 echo "- Disabling DCDC"

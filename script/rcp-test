@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+#
+#  Checks an RCP over its serial port: that it answers, that it keeps
+#  answering bursts of host frames longer than the UART driver's 256-byte
+#  read, that its short and extended source match tables remove the entry
+#  asked for and clear completely, (--pa20) that a board with a 2.4 GHz
+#  20 dBm PA starts at 6 dBm and sets every power from 6 to 20 dBm, and
+#  (--watchdog) that it resets itself when its loop hangs. Expected results follow from spinel, so a correct
+#  RCP passes every check. The source match defects fixed on this branch
+#  fail it; the UART ones fail it only when a burst reaches the driver as a
+#  single read, which depends on the USB bridge's timing.
+#
+#  usage: script/rcp-test /dev/ttyUSB0 [--baudrate 460800] [--reset sonoff] [--pa20]
+#
+#  Needs Python 3 and pyserial. Holds the port alone: stop otbr-agent first.
+
+import argparse
+import os
+import sys
+import time
+
+import serial
+
+# HDLC-lite framing (openthread src/lib/hdlc/hdlc.cpp).
+FLAG, ESCAPE = 0x7E, 0x7D
+ESCAPED = {0x11, 0x13, 0x7D, 0x7E, 0xF8}
+
+# Spinel (openthread src/lib/spinel/spinel.h).
+CMD_NOOP, CMD_RESET, CMD_GET, CMD_SET, CMD_INSERT, CMD_REMOVE = 0, 1, 2, 3, 4, 5
+CMD_IS, CMD_INSERTED, CMD_REMOVED = 6, 7, 8
+PROP_LAST_STATUS, PROP_NCP_VERSION = 0, 2
+PROP_PHY_ENABLED, PROP_PHY_CHAN, PROP_PHY_TX_POWER = 0x20, 0x21, 0x25
+PROP_MAC_15_4_PANID, PROP_MAC_RAW_STREAM_ENABLED = 0x36, 0x37
+PROP_SRC_MATCH_ENABLED, PROP_SRC_MATCH_SHORT, PROP_SRC_MATCH_EXT = 0x1303, 0x1304, 0x1305
+PROP_RCP_API_VERSION = 0xB0
+PROP_DEBUG_TEST_WATCHDOG = 0x4002
+RESET_PLATFORM = 1
+STATUS_OK = 0
+STATUS_RESET_FIRST, STATUS_RESET_LAST = 112, 127
+
+# The TI platform's source match tables (src/radio.h).
+SHORT_SRC_MATCH_SLOTS, EXT_SRC_MATCH_SLOTS = 10, 10
+
+
+def fcs16(data):
+    fcs = 0xFFFF
+    for byte in data:
+        fcs ^= byte
+        for _ in range(8):
+            fcs = (fcs >> 1) ^ 0x8408 if fcs & 1 else fcs >> 1
+    return fcs ^ 0xFFFF
+
+
+def hdlc_encode(frame):
+    fcs = fcs16(frame)
+    out = bytearray([FLAG])
+    for byte in frame + bytes([fcs & 0xFF, fcs >> 8]):
+        if byte in ESCAPED:
+            out += bytes([ESCAPE, byte ^ 0x20])
+        else:
+            out.append(byte)
+    out.append(FLAG)
+    return bytes(out)
+
+
+def packed_uint(value):
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        out.append(byte | (0x80 if value else 0))
+        if not value:
+            return bytes(out)
+
+
+def read_packed_uint(data, pos):
+    value, shift = 0, 0
+    while True:
+        byte = data[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        shift += 7
+        if not byte & 0x80:
+            return value, pos
+
+
+class Rcp:
+    def __init__(self, port, baudrate):
+        # Deassert DTR and RTS before the port opens, as otbr-agent's
+        # uart-init-deassert does: on the auto-BSL sticks they drive the
+        # chip's reset and boot loader pins.
+        self.serial = serial.Serial()
+        self.serial.port = port
+        self.serial.baudrate = baudrate
+        self.serial.rtscts = False
+        self.serial.dtr = False
+        self.serial.rts = False
+        self.serial.timeout = 0.05
+        self.serial.open()
+        self.pending = bytearray()
+        self.frames = []
+        self.bad_frames = 0
+
+    def reset_sonoff(self):
+        # ZBDongle-P (measured): RTS set with DTR clear holds the chip in
+        # reset with the boot loader pin high, so releasing RTS boots the
+        # firmware, which announces itself with a spinel reset status.
+        self.serial.dtr = False
+        self.serial.rts = True
+        time.sleep(0.1)
+        self.serial.rts = False
+        time.sleep(2)
+        self.serial.reset_input_buffer()
+
+    def send(self, tid, cmd, payload=b""):
+        self.serial.write(self.frame(tid, cmd, payload))
+
+    @staticmethod
+    def frame(tid, cmd, payload=b""):
+        return hdlc_encode(bytes([0x80 | tid]) + packed_uint(cmd) + payload)
+
+    def _decode(self):
+        while True:
+            start = self.pending.find(FLAG)
+            if start < 0:
+                self.pending.clear()
+                return
+            end = self.pending.find(FLAG, start + 1)
+            if end < 0:
+                del self.pending[:start]
+                return
+            raw, frame, escaped = self.pending[start + 1 : end], bytearray(), False
+            del self.pending[:end]
+            if not raw:
+                continue
+            for byte in raw:
+                if escaped:
+                    frame.append(byte ^ 0x20)
+                    escaped = False
+                elif byte == ESCAPE:
+                    escaped = True
+                else:
+                    frame.append(byte)
+            if len(frame) < 3 or fcs16(frame[:-2]) != frame[-2] | frame[-1] << 8:
+                self.bad_frames += 1
+                continue
+            self.frames.append(bytes(frame[:-2]))
+
+    def responses(self, timeout):
+        """Frames with a non-zero TID (answers, not unsolicited ones) within timeout."""
+        deadline = time.monotonic() + timeout
+        out = []
+        while time.monotonic() < deadline:
+            self.pending += self.serial.read(4096)
+            self._decode()
+            for frame in self.frames:
+                tid = frame[0] & 0x0F
+                if tid:
+                    cmd, pos = read_packed_uint(frame, 1)
+                    prop, pos = read_packed_uint(frame, pos)
+                    out.append((tid, cmd, prop, frame[pos:]))
+            self.frames.clear()
+        return out
+
+    def call(self, cmd, payload=b"", tid=1, timeout=1.0):
+        self.responses(0)  # drop anything stale
+        self.send(tid, cmd, payload)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            for response in self.responses(0.05):
+                if response[0] == tid:
+                    return response
+        return None
+
+
+class Checks:
+    def __init__(self):
+        self.failed = 0
+
+    def check(self, name, ok, detail=""):
+        print(f"{'PASS' if ok else 'FAIL'}  {name}{'  (' + detail + ')' if detail else ''}")
+        if not ok:
+            self.failed += 1
+        return ok
+
+
+def status(response):
+    """The status a LAST_STATUS response carries, or None for another response."""
+    if response and response[1] == CMD_IS and response[2] == PROP_LAST_STATUS:
+        return read_packed_uint(response[3], 0)[0]
+    return None
+
+
+def check_alive(rcp, checks):
+    version = rcp.call(CMD_GET, packed_uint(PROP_NCP_VERSION))
+    if not checks.check("answers PROP_VALUE_GET NCP_VERSION", version is not None):
+        return False
+    name = version[3].split(b"\x00")[0].decode(errors="replace")
+    print(f"      {name}")
+    api = rcp.call(CMD_GET, packed_uint(PROP_RCP_API_VERSION))
+    checks.check("answers PROP_VALUE_GET RCP_API_VERSION", api is not None,
+                 f"version {read_packed_uint(api[3], 0)[0]}" if api else "")
+    return True
+
+
+def check_burst(rcp, checks, name, count, padding, rounds):
+    """count NOOPs, each padded to make the burst long, written in one go."""
+    lost = 0
+    for _ in range(rounds):
+        rcp.responses(0)
+        tids = [1 + i % 15 for i in range(count)]
+        # The padding is all bytes HDLC escapes, so each one doubles on the wire.
+        burst = b"".join(Rcp.frame(t, CMD_NOOP, bytes([0x7E]) * padding) for t in tids)
+        rcp.serial.write(burst)
+        answered = [r for r in rcp.responses(1.0) if r[1] == CMD_IS and status(r) == STATUS_OK]
+        lost += max(0, count - len(answered))
+    wire = len(Rcp.frame(1, CMD_NOOP, bytes([0x7E]) * padding)) * count
+    return checks.check(f"{name}: every frame answered", lost == 0,
+                        f"{rounds} bursts of {count} frames, {wire} bytes each; {lost} unanswered, "
+                        f"{rcp.bad_frames} bad frames from the RCP")
+
+
+def ext_address(i):
+    return bytes([0x5A, 0xA5, 0, 0, 0, 0, 0, i])
+
+
+def check_src_match(rcp, checks):
+    # Receive on a channel, so the radio runs its RX command and the table
+    # changes through the RF core, as during a Thread network's life.
+    for prop, value in ((PROP_PHY_ENABLED, b"\x01"), (PROP_PHY_CHAN, b"\x1a"),
+                        (PROP_MAC_15_4_PANID, b"\x34\x12"), (PROP_MAC_RAW_STREAM_ENABLED, b"\x01"),
+                        (PROP_SRC_MATCH_ENABLED, b"\x01")):
+        if not checks.check(f"PROP_VALUE_SET {prop:#06x}", rcp.call(CMD_SET, packed_uint(prop) + value) is not None):
+            return
+
+    ext = packed_uint(PROP_SRC_MATCH_EXT)
+
+    def insert(i):
+        r = rcp.call(CMD_INSERT, ext + ext_address(i))
+        return r is not None and r[1] == CMD_INSERTED
+
+    def remove(i):
+        r = rcp.call(CMD_REMOVE, ext + ext_address(i))
+        return r is not None and r[1] == CMD_REMOVED
+
+    # A full table; remove the last entry, add another in its place: every
+    # other entry stays, so removing the second one still succeeds.
+    rcp.call(CMD_SET, ext)  # clear the table
+    checks.check("fills the extended source match table",
+                 all(insert(i) for i in range(EXT_SRC_MATCH_SLOTS)))
+    checks.check("removes the last entry", remove(EXT_SRC_MATCH_SLOTS - 1))
+    checks.check("adds an entry in the freed slot", insert(0x80))
+    checks.check("removes an entry it did not touch (the second)", remove(1))
+
+    # Setting the list empty clears every entry, so the whole table is free.
+    rcp.call(CMD_SET, ext)
+    checks.check("after clearing the table, fills it again",
+                 all(insert(0x40 + i) for i in range(EXT_SRC_MATCH_SLOTS)))
+    rcp.call(CMD_SET, ext)
+
+    short = packed_uint(PROP_SRC_MATCH_SHORT)
+
+    def insert_short(i):
+        r = rcp.call(CMD_INSERT, short + bytes([i, 0x7A]))
+        return r is not None and r[1] == CMD_INSERTED
+
+    rcp.call(CMD_SET, short)
+    checks.check("fills the short source match table",
+                 all(insert_short(i) for i in range(SHORT_SRC_MATCH_SLOTS)))
+    rcp.call(CMD_SET, short)
+    checks.check("after clearing the short table, fills it again",
+                 all(insert_short(0x40 + i) for i in range(SHORT_SRC_MATCH_SLOTS)))
+    rcp.call(CMD_SET, short)
+
+    rcp.call(CMD_SET, packed_uint(PROP_MAC_RAW_STREAM_ENABLED) + b"\x00")
+    rcp.call(CMD_SET, packed_uint(PROP_PHY_ENABLED) + b"\x00")
+
+
+def wait_reset(rcp, timeout):
+    """Whether the RCP announces a reset (a reset status, TID 0) within timeout."""
+    deadline = time.monotonic() + timeout
+    reset = False
+    while time.monotonic() < deadline and not reset:
+        rcp.pending += rcp.serial.read(4096)
+        rcp._decode()
+        for frame in rcp.frames:
+            cmd, pos = read_packed_uint(frame, 1)
+            prop, pos = read_packed_uint(frame, pos)
+            if cmd == CMD_IS and prop == PROP_LAST_STATUS:
+                code = read_packed_uint(frame, pos)[0]
+                reset = reset or STATUS_RESET_FIRST <= code <= STATUS_RESET_LAST
+        rcp.frames.clear()
+    return reset
+
+
+def check_pa20(rcp, checks):
+    # The CC1352P-2 design (the Sonoff ZBDongle-P): TI's PA data covers -20
+    # to 5 dBm on the default PA and 14 to 20 dBm on the high PA, the
+    # platform adds 6 to 13 dBm, and a request between steps gets the step
+    # below. Channels 25 and 26 cap at 19 and 15 dBm (src/radio.c).
+    tx_power = packed_uint(PROP_PHY_TX_POWER)
+
+    def power():
+        r = rcp.call(CMD_GET, tx_power)
+        return int.from_bytes(r[3][:1], "little", signed=True) if r and r[2] == PROP_PHY_TX_POWER else None
+
+    def set_power(dbm):
+        rcp.call(CMD_SET, tx_power + dbm.to_bytes(1, "little", signed=True))
+        return power()
+
+    def channel(ch):
+        rcp.call(CMD_SET, packed_uint(PROP_PHY_CHAN) + bytes([ch]))
+
+    # A platform reset first, so the power is the firmware's default and not
+    # one a host set: a stack reset (otInstanceResetRadioStack) keeps it.
+    rcp.responses(0)
+    rcp.send(0, CMD_RESET, bytes([RESET_PLATFORM]))
+    checks.check("reboots on CMD_RESET(PLATFORM)", wait_reset(rcp, 3))
+    checks.check("starts at 6 dBm", power() == 6, f"{power()} dBm")
+
+    # otbr-agent sets the power from its radio URL before it enables the
+    # radio, so the RCP must take one while the radio is disabled.
+    refused = rcp.call(CMD_SET, tx_power + (-21).to_bytes(1, "little", signed=True))
+    checks.check("refuses a power below its table and keeps the last one",
+                 status(refused) not in (None, STATUS_OK) and power() == 6, f"{power()} dBm")
+    checks.check("takes a power while the radio is disabled", set_power(9) == 9, f"{power()} dBm")
+    checks.check("still answers after that", check_alive(rcp, Checks()))
+    channel(20)
+    rcp.call(CMD_SET, packed_uint(PROP_PHY_ENABLED) + b"\x01")
+    checks.check("keeps that power once enabled", power() == 9, f"{power()} dBm")
+    rcp.call(CMD_SET, packed_uint(PROP_MAC_RAW_STREAM_ENABLED) + b"\x01")
+    checks.check("keeps that power once receiving", power() == 9, f"{power()} dBm")
+
+    wrong = {dbm: got for dbm in range(6, 21) if (got := set_power(dbm)) != dbm}
+    checks.check("sets every power from 6 to 20 dBm", not wrong,
+                 ", ".join(f"{dbm} gave {got}" for dbm, got in wrong.items()))
+    checks.check("takes the step below between steps", set_power(-7) == -9, f"-7 gave {power()}")
+
+    set_power(20)
+    channel(25)
+    checks.check("caps channel 25 at 19 dBm", set_power(20) == 19, f"{power()} dBm")
+    channel(26)
+    checks.check("caps channel 26 at 15 dBm", set_power(20) == 15, f"{power()} dBm")
+
+    # Disabled again after being enabled: the RF driver client is closed.
+    rcp.call(CMD_SET, packed_uint(PROP_MAC_RAW_STREAM_ENABLED) + b"\x00")
+    rcp.call(CMD_SET, packed_uint(PROP_PHY_ENABLED) + b"\x00")
+    channel(20)
+    checks.check("takes a power after the radio is disabled again", set_power(14) == 14, f"{power()} dBm")
+    checks.check("still answers after that", check_alive(rcp, Checks()))
+
+    # Leave the firmware's default, not the 20 dBm set above: a host that
+    # sets no power of its own keeps it across the stack reset it sends.
+    rcp.send(0, CMD_RESET, bytes([RESET_PLATFORM]))
+    checks.check("reboots to its default afterwards", wait_reset(rcp, 3))
+
+
+def check_watchdog(rcp, checks):
+    # Getting this property makes the RCP spin forever (openthread
+    # src/ncp/ncp_base.cpp): only a watchdog brings it back.
+    rcp.responses(0)
+    rcp.send(1, CMD_GET, packed_uint(PROP_DEBUG_TEST_WATCHDOG))
+    checks.check("resets itself when its loop hangs", wait_reset(rcp, 10))
+    checks.check("answers after that reset", check_alive(rcp, Checks()))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Check an OpenThread RCP over its serial port.")
+    parser.add_argument("port")
+    parser.add_argument("--baudrate", type=int, default=460800)
+    parser.add_argument("--reset", choices=["sonoff"], help="reset the RCP first through DTR/RTS")
+    parser.add_argument("--rounds", type=int, default=20)
+    parser.add_argument("--pa20", action="store_true",
+                        help="also check the transmit powers of a board with a 2.4 GHz 20 dBm PA "
+                        "(CC1352P-2 LaunchPad, Sonoff ZBDongle-P)")
+    parser.add_argument("--watchdog", action="store_true",
+                        help="also hang the RCP on purpose and expect it to reset (a stick without a "
+                        "watchdog then needs --reset sonoff or a replug)")
+    args = parser.parse_args()
+
+    rcp = Rcp(args.port, args.baudrate)
+    if args.reset == "sonoff":
+        rcp.reset_sonoff()
+    checks = Checks()
+
+    if check_alive(rcp, checks):
+        # Bursts longer than the UART driver's 256-byte read. At most 15
+        # frames each: the RCP queues replies to that many commands
+        # (OPENTHREAD_CONFIG_NCP_SPINEL_RESPONSE_QUEUE_SIZE), and drops the
+        # rest by design.
+        check_burst(rcp, checks, "few long frames", count=4, padding=60, rounds=args.rounds)
+        check_burst(rcp, checks, "many short frames", count=15, padding=10, rounds=args.rounds)
+        checks.check("still answers after the bursts", check_alive(rcp, Checks()))
+        check_src_match(rcp, checks)
+        if args.pa20:
+            check_pa20(rcp, checks)
+        if args.watchdog:
+            check_watchdog(rcp, checks)
+
+    print(f"{checks.failed} failed" if checks.failed else "all passed")
+    sys.exit(1 if checks.failed else 0)
+
+
+if __name__ == "__main__":
+    main()

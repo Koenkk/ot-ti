@@ -40,8 +40,7 @@
 #include <ti/drivers/dpl/HwiP.h>
 
 #include "system.h"
-#include <string.h>
-#include <mqueue.h>
+#include <stdbool.h>
 
 /* Ensure all bytes are written in blocking mode before notifying the stack it
  * can send more data. Less efficient than callback mode. Necessary for certain
@@ -53,7 +52,11 @@
 #define PLATFORM_UART_EVENT_RX_DONE (1U << 1)
 
 #define PLATFORM_UART_RECV_BUF_LEN 256
-#define PLATFORM_UART_RECV_MQUEUE_LEN 6
+
+/* Bytes received and not yet handed to the stack. A power of two, so the
+ * free-running indices below wrap with it.
+ */
+#define PLATFORM_UART_RX_RING_LEN 1024
 
 static uint8_t PlatformUart_receiveBuffer[PLATFORM_UART_RECV_BUF_LEN];
 
@@ -64,13 +67,19 @@ static SemaphoreP_Struct PlatformUart_writeSem;
 static SemaphoreP_Handle PlatformUart_writeSemHandle;
 #endif
 
-/* Local Message Queue for Incoming Data */
-const  char  UART_procQueueName[] = "/uartrx_process";
-static mqd_t UART_procQueueDesc;
-struct UART_procQueueMsg {
-    uint8_t rxBuffer[PLATFORM_UART_RECV_BUF_LEN];
-    uint8_t readLen;
-};
+/* Received bytes pass from the read callback (Hwi) to the processing loop
+ * through this ring: the callback alone advances the head, the loop alone
+ * the tail. The callback signals the loop only when no signal is pending,
+ * so the UART holds at most one RX slot of the processing queue, whose size
+ * system.c budgets for, however many reads complete before the loop runs.
+ */
+static uint8_t           PlatformUart_rxRing[PLATFORM_UART_RX_RING_LEN];
+static volatile uint32_t PlatformUart_rxHead;
+static volatile uint32_t PlatformUart_rxTail;
+static volatile bool     PlatformUart_rxSignalPending;
+
+/* A send-done whose signal found the processing queue full. */
+static bool PlatformUart_txDoneLost;
 
 static void uartReadCallback(UART2_Handle aHandle, void *aBuf, size_t aLen, void *userArg, int_fast16_t status)
 {
@@ -78,14 +87,34 @@ static void uartReadCallback(UART2_Handle aHandle, void *aBuf, size_t aLen, void
     (void)aBuf;
     (void)userArg;
     (void)status;
-    struct UART_procQueueMsg rxMsg;
+    uint32_t head  = PlatformUart_rxHead;
+    uint32_t space = PLATFORM_UART_RX_RING_LEN - (head - PlatformUart_rxTail);
+    size_t   i;
 
-    memcpy(rxMsg.rxBuffer, PlatformUart_receiveBuffer, aLen);
-    rxMsg.readLen = aLen;
+    /* Bytes beyond the ring's space are dropped: the frame they belong to
+     * fails its HDLC check, and the host, missing its response, treats the
+     * RCP as failed and recovers it.
+     */
+    if (aLen > space)
+    {
+        aLen = space;
+    }
 
-    /* Process incoming data in task context */
-    mq_send(UART_procQueueDesc, (char *)&rxMsg, sizeof(struct UART_procQueueMsg), 0);
-    platformUartSignal(PLATFORM_UART_EVENT_RX_DONE);
+    for (i = 0; i < aLen; i++)
+    {
+        PlatformUart_rxRing[(head + i) % PLATFORM_UART_RX_RING_LEN] = PlatformUart_receiveBuffer[i];
+    }
+    PlatformUart_rxHead = head + aLen;
+
+    if (!PlatformUart_rxSignalPending)
+    {
+        PlatformUart_rxSignalPending = true;
+        if (!platformUartSignal(PLATFORM_UART_EVENT_RX_DONE))
+        {
+            /* not queued: the next read signals again */
+            PlatformUart_rxSignalPending = false;
+        }
+    }
 
     UART2_read(PlatformUart_uartHandle, PlatformUart_receiveBuffer, sizeof(PlatformUart_receiveBuffer), NULL);
 }
@@ -106,7 +135,6 @@ static void uartWriteCallback(UART2_Handle aHandle, void *aBuf, size_t aLen, voi
 otError otPlatUartEnable(void)
 {
     UART2_Params params;
-    struct mq_attr attr;
 
 #if !TI_PLAT_UART_BLOCKING
     PlatformUart_writeSemHandle = SemaphoreP_constructBinary(&PlatformUart_writeSem, 1U);
@@ -130,13 +158,6 @@ otError otPlatUartEnable(void)
     params.writeMode     = UART2_Mode_CALLBACK;
     params.writeCallback = uartWriteCallback;
 #endif
-
-    attr.mq_curmsgs = 0;
-    attr.mq_flags   = 0;
-    attr.mq_maxmsg  = PLATFORM_UART_RECV_MQUEUE_LEN;
-    attr.mq_msgsize = sizeof(struct UART_procQueueMsg);
-
-    UART_procQueueDesc = mq_open(UART_procQueueName, (O_RDWR | O_NONBLOCK | O_CREAT), 0, &attr);
 
     PlatformUart_uartHandle = UART2_open(CONFIG_UART2_0, &params);
 
@@ -163,7 +184,10 @@ otError otPlatUartSend(const uint8_t *aBuf, uint16_t aBufLength)
     ret = UART2_write(PlatformUart_uartHandle, aBuf, aBufLength, NULL);
 
 #if TI_PLAT_UART_BLOCKING
-    platformUartSignal(PLATFORM_UART_EVENT_TX_DONE);
+    if (!platformUartSignal(PLATFORM_UART_EVENT_TX_DONE))
+    {
+        PlatformUart_txDoneLost = true;
+    }
 #endif
 
     return OT_ERROR_NONE;
@@ -178,10 +202,47 @@ void platformUartProcess(uintptr_t arg)
 
     if (arg & PLATFORM_UART_EVENT_RX_DONE)
     {
-        struct UART_procQueueMsg rxMsg;
+        /* Cleared before draining: a read completing from here on signals
+         * again, and one completing before has its bytes drained below.
+         */
+        PlatformUart_rxSignalPending = false;
 
-        mq_receive(UART_procQueueDesc, (char *)&rxMsg, sizeof(struct UART_procQueueMsg), NULL);
-        otPlatUartReceived(rxMsg.rxBuffer, rxMsg.readLen);
+        while (PlatformUart_rxTail != PlatformUart_rxHead)
+        {
+            uint32_t tail  = PlatformUart_rxTail;
+            uint32_t start = tail % PLATFORM_UART_RX_RING_LEN;
+            uint32_t len   = PlatformUart_rxHead - tail;
+
+            if (len > PLATFORM_UART_RX_RING_LEN - start)
+            {
+                len = PLATFORM_UART_RX_RING_LEN - start;
+            }
+
+            otPlatUartReceived(&PlatformUart_rxRing[start], (uint16_t)len);
+            PlatformUart_rxTail = tail + len;
+        }
+    }
+}
+
+void platformUartPoll(void)
+{
+    uintptr_t events = 0;
+
+    /* With a signal pending, its own message drains the ring. */
+    if (!PlatformUart_rxSignalPending && PlatformUart_rxTail != PlatformUart_rxHead)
+    {
+        events |= PLATFORM_UART_EVENT_RX_DONE;
+    }
+
+    if (PlatformUart_txDoneLost)
+    {
+        PlatformUart_txDoneLost = false;
+        events |= PLATFORM_UART_EVENT_TX_DONE;
+    }
+
+    if (events != 0)
+    {
+        platformUartProcess(events);
     }
 }
 

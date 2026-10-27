@@ -98,8 +98,12 @@ add_custom_command(
         ${SYSCONFIG_OUTPUT_OTHER}
     COMMAND
         ${syscfg_cmd}
+    COMMAND
+        bash ${PROJECT_SOURCE_DIR}/patch-syscfg.sh
+    WORKING_DIRECTORY
+        ${CMAKE_CURRENT_BINARY_DIR}
     DEPENDS
-        ${sysconfig_file} 
+        ${sysconfig_file} ${PROJECT_SOURCE_DIR}/patch-syscfg.sh
     VERBATIM
 )
 

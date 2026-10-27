@@ -36,6 +36,7 @@
 
 #include <openthread-system.h>
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -104,14 +105,22 @@ void platformRandomInit(void);
 /**
  * Signal the processing loop to process the uart module.
  *
+ * @return true if the signal was queued, false if the processing queue was full.
  */
-void platformUartSignal(uintptr_t arg);
+bool platformUartSignal(uintptr_t arg);
 
 /**
  * This method performs uart driver processing.
  *
  */
 void platformUartProcess(uintptr_t arg);
+
+/**
+ * Process the uart module as if its signals had all arrived: for work whose
+ * signal found the processing queue full. Harmless when there is none.
+ *
+ */
+void platformUartPoll(void);
 
 /**
  * Signal the processing loop to process the spi module.
